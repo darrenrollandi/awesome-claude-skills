@@ -53,6 +53,26 @@ Response Requirements:
 - Your response should go last"""
 
 
+# Non-streaming requests should stay at or below ~16K output tokens (the SDK's
+# HTTP timeout bites above that). On claude-fable-5-1 thinking is always on and
+# shares this cap with the answer, so the previous 4096 risked cutting a task
+# off mid-thought.
+MAX_TOKENS = 16000
+
+# claude-fable-5-1 runs safety classifiers that can decline a request (HTTP 200,
+# stop_reason="refusal"). Server-side fallbacks re-run the same request on a
+# fallback model inside the same call, so an occasional false positive does not
+# fail an evaluation task. Attached only for Fable/Mythos models: a fallback
+# entry must be in the requested model's allowed list.
+FALLBACK_MODELS = [{"model": "claude-opus-4-8"}]
+
+
+def fallback_kwargs(model: str) -> dict[str, Any]:
+    if model.startswith(("claude-fable", "claude-mythos")):
+        return {"betas": ["server-side-fallback-2026-06-01"], "fallbacks": FALLBACK_MODELS}
+    return {}
+
+
 def parse_evaluation_file(file_path: Path) -> list[dict[str, Any]]:
     """Parse XML evaluation file with qa_pair elements."""
     try:
@@ -92,57 +112,70 @@ async def agent_loop(
 ) -> tuple[str, dict[str, Any]]:
     """Run the agent loop with MCP tools."""
     messages = [{"role": "user", "content": question}]
-
-    response = await asyncio.to_thread(
-        client.messages.create,
+    request = dict(
         model=model,
-        max_tokens=4096,
+        max_tokens=MAX_TOKENS,
         system=EVALUATION_PROMPT,
-        messages=messages,
         tools=tools,
+        **fallback_kwargs(model),
     )
 
+    response = await asyncio.to_thread(client.beta.messages.create, messages=messages, **request)
+    # Append the model's turn exactly as received - thinking blocks included and
+    # unedited. The history is append-only from here on.
     messages.append({"role": "assistant", "content": response.content})
 
     tool_metrics = {}
 
     while response.stop_reason == "tool_use":
-        tool_use = next(block for block in response.content if block.type == "tool_use")
-        tool_name = tool_use.name
-        tool_input = tool_use.input
+        # Execute EVERY tool_use block in the turn and return all results in ONE
+        # user message. Answering only the first leaves the other tool_use ids
+        # unmatched, which the API rejects on the next request - and current
+        # models call tools in parallel routinely.
+        results = []
+        for tool_use in (block for block in response.content if block.type == "tool_use"):
+            tool_name = tool_use.name
+            tool_input = tool_use.input
 
-        tool_start_ts = time.time()
-        try:
-            tool_result = await connection.call_tool(tool_name, tool_input)
-            tool_response = json.dumps(tool_result) if isinstance(tool_result, (dict, list)) else str(tool_result)
-        except Exception as e:
-            tool_response = f"Error executing tool {tool_name}: {str(e)}\n"
-            tool_response += traceback.format_exc()
-        tool_duration = time.time() - tool_start_ts
+            tool_start_ts = time.time()
+            is_error = False
+            try:
+                tool_result = await connection.call_tool(tool_name, tool_input)
+                tool_response = json.dumps(tool_result) if isinstance(tool_result, (dict, list)) else str(tool_result)
+            except Exception as e:
+                is_error = True
+                tool_response = f"Error executing tool {tool_name}: {str(e)}\n"
+                tool_response += traceback.format_exc()
+            tool_duration = time.time() - tool_start_ts
 
-        if tool_name not in tool_metrics:
-            tool_metrics[tool_name] = {"count": 0, "durations": []}
-        tool_metrics[tool_name]["count"] += 1
-        tool_metrics[tool_name]["durations"].append(tool_duration)
+            if tool_name not in tool_metrics:
+                tool_metrics[tool_name] = {"count": 0, "durations": []}
+            tool_metrics[tool_name]["count"] += 1
+            tool_metrics[tool_name]["durations"].append(tool_duration)
 
-        messages.append({
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": tool_use.id,
-                "content": tool_response,
-            }]
-        })
+            result_block = {"type": "tool_result", "tool_use_id": tool_use.id, "content": tool_response}
+            if is_error:
+                result_block["is_error"] = True
+            results.append(result_block)
 
-        response = await asyncio.to_thread(
-            client.messages.create,
-            model=model,
-            max_tokens=4096,
-            system=EVALUATION_PROMPT,
-            messages=messages,
-            tools=tools,
-        )
+        messages.append({"role": "user", "content": results})
+
+        response = await asyncio.to_thread(client.beta.messages.create, messages=messages, **request)
         messages.append({"role": "assistant", "content": response.content})
+
+    if response.stop_reason == "refusal":
+        # The classifiers declined (content is empty, or partial after a
+        # mid-stream stop). With fallbacks on, this means every model in the
+        # chain declined. Surface it in the report rather than scoring a silent
+        # N/A. stop_details can be None even on a refusal, so read it defensively.
+        category = getattr(getattr(response, "stop_details", None), "category", None)
+        print(f"⚠️  Model refused the task (stop_reason=refusal, category={category})", file=sys.stderr)
+        return (
+            "<response>REFUSED</response>"
+            f"<feedback>The request was declined by the model's safety classifiers "
+            f"(category={category}); the task was not attempted.</feedback>",
+            tool_metrics,
+        )
 
     response_text = next(
         (block.text for block in response.content if hasattr(block, "text")),
@@ -220,7 +253,7 @@ TASK_TEMPLATE = """
 async def run_evaluation(
     eval_path: Path,
     connection: Any,
-    model: str = "claude-3-7-sonnet-20250219",
+    model: str = "claude-fable-5-1",
 ) -> str:
     """Run evaluation with MCP server tools."""
     print("🚀 Starting Evaluation")
@@ -315,13 +348,13 @@ Examples:
   python evaluation.py -t sse -u https://example.com/mcp -H "Authorization: Bearer token" eval.xml
 
   # Evaluate an HTTP MCP server with custom model
-  python evaluation.py -t http -u https://example.com/mcp -m claude-3-5-sonnet-20241022 eval.xml
+  python evaluation.py -t http -u https://example.com/mcp -m claude-opus-5 eval.xml
         """,
     )
 
     parser.add_argument("eval_file", type=Path, help="Path to evaluation XML file")
     parser.add_argument("-t", "--transport", choices=["stdio", "sse", "http"], default="stdio", help="Transport type (default: stdio)")
-    parser.add_argument("-m", "--model", default="claude-3-7-sonnet-20250219", help="Claude model to use (default: claude-3-7-sonnet-20250219)")
+    parser.add_argument("-m", "--model", default="claude-fable-5-1", help="Claude model to use (default: claude-fable-5-1)")
 
     stdio_group = parser.add_argument_group("stdio options")
     stdio_group.add_argument("-c", "--command", help="Command to run MCP server (stdio only)")
